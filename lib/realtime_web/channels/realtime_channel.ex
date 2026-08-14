@@ -35,6 +35,7 @@ defmodule RealtimeWeb.RealtimeChannel do
 
   @confirm_token_ms_interval :timer.minutes(5)
   @replication_ready_check_interval 500
+  @postgres_changes_wait_interval 100
   @fullsweep_after Application.compile_env!(:realtime, :websocket_fullsweep_after)
 
   @impl true
@@ -107,6 +108,7 @@ defmodule RealtimeWeb.RealtimeChannel do
       presence_enabled? = socket.assigns.presence_enabled?
 
       pg_change_params = pg_change_params(is_new_api, params, channel_pid, claims, sub_topic)
+      wait_for_postgres_changes? = Join.wait_for_postgres_changes?(join)
 
       opts = %{
         is_new_api: is_new_api,
@@ -114,7 +116,8 @@ defmodule RealtimeWeb.RealtimeChannel do
         transport_pid: transport_pid,
         serializer: serializer,
         topic: topic,
-        tenant: tenant_id
+        tenant: tenant_id,
+        wait_for_postgres_changes?: wait_for_postgres_changes?
       }
 
       postgres_cdc_subscribe(tenant, opts)
@@ -159,9 +162,9 @@ defmodule RealtimeWeb.RealtimeChannel do
 
       UsersCounter.add(transport_pid, tenant_id)
 
-      case await_muster_join(muster_join_task, socket) do
-        :ok -> {:ok, state, assign(socket, assigns)}
-        {:error, _} = error -> error
+      with :ok <- await_muster_join(muster_join_task, socket),
+           :ok <- await_postgres_changes(socket, wait_for_postgres_changes?, pg_change_params, join) do
+        {:ok, state, assign(socket, assigns)}
       end
     else
       {:error, :expired_token, msg} ->
@@ -346,46 +349,34 @@ defmodule RealtimeWeb.RealtimeChannel do
     {:noreply, socket}
   end
 
+  def handle_info(:postgres_changes_subscribed, %{assigns: %{channel_name: channel_name}} = socket) do
+    push_postgres_changes_subscribed(socket, channel_name)
+    {:noreply, socket}
+  end
+
   def handle_info(:postgres_subscribe, %{assigns: %{channel_name: channel_name}} = socket) do
-    %{
-      assigns: %{
-        tenant: tenant_id,
-        pg_sub_ref: pg_sub_ref,
-        pg_change_params: pg_change_params
-      }
-    } = socket
+    %{assigns: %{pg_sub_ref: pg_sub_ref, pg_change_params: pg_change_params}} = socket
 
     Helpers.cancel_timer(pg_sub_ref)
 
-    %Tenant{} = tenant = Cache.get_tenant_by_external_id(tenant_id)
-    {:ok, module} = PostgresCdc.driver(tenant.postgres_cdc_default)
-    postgres_extension = PostgresCdc.filter_settings(tenant.postgres_cdc_default, tenant.extensions)
+    case postgres_subscribe_attempt(socket, pg_change_params) do
+      {:ok, _response} ->
+        push_postgres_changes_subscribed(socket, channel_name)
+        {:noreply, assign(socket, :pg_sub_ref, nil)}
 
-    args = %{"region" => postgres_extension["region"], "id" => tenant_id}
+      {:error, :fatal, error} ->
+        maybe_log_warning(socket, "RealtimeDisabledForConfiguration", error)
+        push_system_message("postgres_changes", socket, "error", error, channel_name)
+        # No point in retrying if the params are invalid
+        {:noreply, assign(socket, :pg_sub_ref, nil)}
 
-    case PostgresCdc.connect(module, args) do
-      {:ok, response} ->
-        case PostgresCdc.after_connect(module, response, postgres_extension, pg_change_params, tenant_id) do
-          {:ok, _response} ->
-            message = "Subscribed to PostgreSQL"
-            maybe_log_info(socket, message)
-            push_system_message("postgres_changes", socket, "ok", message, channel_name)
-            {:noreply, assign(socket, :pg_sub_ref, nil)}
+      {:error, :retry, error} ->
+        maybe_log_warning(socket, "RealtimeDisabledForConfiguration", error)
 
-          {:error, {reason, error}} when reason in [:malformed_subscription_params, :subscription_insert_failed] ->
-            maybe_log_warning(socket, "RealtimeDisabledForConfiguration", error)
-            push_system_message("postgres_changes", socket, "error", error, channel_name)
-            # No point in retrying if the params are invalid
-            {:noreply, assign(socket, :pg_sub_ref, nil)}
+        push_system_message("postgres_changes", socket, "error", error, channel_name)
+        {:noreply, assign(socket, :pg_sub_ref, postgres_subscribe(5, 10))}
 
-          error ->
-            maybe_log_warning(socket, "RealtimeDisabledForConfiguration", error)
-
-            push_system_message("postgres_changes", socket, "error", error, channel_name)
-            {:noreply, assign(socket, :pg_sub_ref, postgres_subscribe(5, 10))}
-        end
-
-      nil ->
+      {:error, :not_connected} ->
         maybe_log_warning(
           socket,
           "ReconnectSubscribeToPostgres",
@@ -394,7 +385,7 @@ defmodule RealtimeWeb.RealtimeChannel do
 
         {:noreply, assign(socket, :pg_sub_ref, postgres_subscribe())}
 
-      error ->
+      {:error, :connect_failed, error} ->
         maybe_log_error(socket, "UnableToSubscribeToPostgres", error)
         push_system_message("postgres_changes", socket, "error", error, channel_name)
         {:noreply, assign(socket, :pg_sub_ref, postgres_subscribe(5, 10))}
@@ -935,9 +926,75 @@ defmodule RealtimeWeb.RealtimeChannel do
     {:ok, module} = PostgresCdc.driver(tenant.postgres_cdc_default)
     PostgresCdc.subscribe(module, pg_change_params, tenant.external_id, metadata)
 
-    send(self(), :postgres_subscribe)
+    unless opts[:wait_for_postgres_changes?], do: send(self(), :postgres_subscribe)
 
     pg_change_params
+  end
+
+  @spec postgres_subscribe_attempt(Phoenix.Socket.t(), list()) ::
+          {:ok, term()} | {:error, :not_connected} | {:error, :fatal | :retry | :connect_failed, term()}
+  defp postgres_subscribe_attempt(%{assigns: %{tenant: tenant_id}}, pg_change_params) do
+    %Tenant{} = tenant = Cache.get_tenant_by_external_id(tenant_id)
+    {:ok, module} = PostgresCdc.driver(tenant.postgres_cdc_default)
+    postgres_extension = PostgresCdc.filter_settings(tenant.postgres_cdc_default, tenant.extensions)
+
+    args = %{"region" => postgres_extension["region"], "id" => tenant_id}
+
+    case PostgresCdc.connect(module, args) do
+      {:ok, response} ->
+        case PostgresCdc.after_connect(module, response, postgres_extension, pg_change_params, tenant_id) do
+          {:ok, _response} = ok ->
+            ok
+
+          {:error, {reason, error}} when reason in [:malformed_subscription_params, :subscription_insert_failed] ->
+            {:error, :fatal, error}
+
+          error ->
+            {:error, :retry, error}
+        end
+
+      nil ->
+        {:error, :not_connected}
+
+      error ->
+        {:error, :connect_failed, error}
+    end
+  end
+
+  defp await_postgres_changes(_socket, false, _pg_change_params, _join), do: :ok
+  defp await_postgres_changes(_socket, true, [], _join), do: :ok
+
+  defp await_postgres_changes(socket, true, pg_change_params, join) do
+    deadline = System.monotonic_time(:millisecond) + Join.postgres_changes_timeout(join)
+    await_postgres_changes(socket, pg_change_params, deadline)
+  end
+
+  defp await_postgres_changes(socket, pg_change_params, deadline) do
+    case postgres_subscribe_attempt(socket, pg_change_params) do
+      {:ok, _response} ->
+        send(self(), :postgres_changes_subscribed)
+        :ok
+
+      {:error, :not_connected} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          message = "Timed out waiting for postgres_changes subscription"
+          log_error(socket, "PostgresChangesSubscribeTimeout", message)
+          {:error, %{reason: message}}
+        else
+          Process.sleep(@postgres_changes_wait_interval)
+          await_postgres_changes(socket, pg_change_params, deadline)
+        end
+
+      {:error, _kind, error} ->
+        log_error(socket, "RealtimeDisabledForConfiguration", error)
+        {:error, %{reason: "Unable to subscribe to changes: #{inspect(error)}"}}
+    end
+  end
+
+  defp push_postgres_changes_subscribed(socket, channel_name) do
+    message = "Subscribed to PostgreSQL"
+    maybe_log_info(socket, message)
+    push_system_message("postgres_changes", socket, "ok", message, channel_name)
   end
 
   defp add_id_to_postgres_changes(pg_change_params) do

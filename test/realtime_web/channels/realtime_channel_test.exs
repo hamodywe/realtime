@@ -308,6 +308,26 @@ defmodule RealtimeWeb.RealtimeChannelTest do
       # It will try again in the future
       assert socket.assigns.pg_sub_ref != nil
     end
+
+    test "wait rejects the join when the subscription is not established in time", %{tenant: tenant} do
+      stub(Extensions.PostgresCdcRls, :handle_connect, fn _ -> nil end)
+
+      assert {:error, %{reason: "Timed out waiting for postgres_changes subscription"}} =
+               join_waiting_for_postgres_changes(tenant, %{"wait" => true, "timeout" => 100})
+    end
+
+    test "wait does not gate a join without postgres_changes bindings", %{tenant: tenant} do
+      stub(Extensions.PostgresCdcRls, :handle_connect, fn _ -> nil end)
+
+      assert {:ok, %{postgres_changes: []}, _socket} =
+               join_waiting_for_postgres_changes(tenant, %{"wait" => true, "timeout" => 100}, [])
+    end
+
+    test "join is not gated when wait is not requested", %{tenant: tenant} do
+      stub(Extensions.PostgresCdcRls, :handle_connect, fn _ -> nil end)
+
+      assert {:ok, _reply, _socket} = join_waiting_for_postgres_changes(tenant, %{"wait" => false})
+    end
   end
 
   describe "broadcast" do
@@ -1723,6 +1743,14 @@ defmodule RealtimeWeb.RealtimeChannelTest do
         x_headers: [{"x-api-key", token}]
       }
     ]
+  end
+
+  defp join_waiting_for_postgres_changes(tenant, options, changes \\ [%{"event" => "INSERT", "schema" => "public"}]) do
+    jwt = Generators.generate_jwt_token(tenant)
+    {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
+    config = %{"postgres_changes" => changes, "postgres_changes_options" => options}
+
+    subscribe_and_join(socket, "realtime:test", %{"config" => config})
   end
 
   defp update_extension(tenant, extension) do
